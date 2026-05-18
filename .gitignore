@@ -1,0 +1,22 @@
+# Python 编译缓存
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# 开发工具配置
+.vscode/
+.idea/
+
+# 数据与大文件（如果是做数据科学项目，强烈建议排除大原始数据）
+*.csv
+*.xlsx
+*.xls
+.ipynb_checkpoints/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+*.pt
+*.mat
