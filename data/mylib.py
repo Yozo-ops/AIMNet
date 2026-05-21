@@ -90,9 +90,12 @@ def split_and_finalize_data(data, train_ratio=0.7):
     C = compute_C(train_Y, train_G)
     C = convert_C_to_edge_index(C)
 
+    C_test = compute_C(test_Y, test_G)
+    C_test = convert_C_to_edge_index(C_test)
+
     return {
         'train': {'X': train_X, 'Y': train_Y, 'W': train_W, 'G': train_G, 'C': C, },
-        'test': {'X': test_X, 'Y': test_Y, 'W': test_W, 'G': test_G}
+        'test': {'X': test_X, 'Y': test_Y, 'W': test_W, 'G': test_G, 'C': C_test}
     }
 
 
@@ -127,3 +130,7 @@ def data_processing(file_path, train_ratio=0.7, missing_rate=0.5):
     data = {'X': X_list, 'Y': Y, 'W': W, 'G': G}
     data = split_and_finalize_data(data, train_ratio)
     return data
+
+if __name__ == "__main__":
+    data = torch.load("data/processed/train_and_test_corel5k_03test_rate_05missing_rate.pt")
+    print(data['test'].keys())

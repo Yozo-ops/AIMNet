@@ -2,6 +2,10 @@ import torch
 import torch.optim as optim
 import numpy as np
 from sklearn.metrics import average_precision_score, hamming_loss, roc_auc_score
+import matplotlib.pyplot as plt
+import models
+import os 
+
 
 def compute_metrics(y_true, y_pred, G):
     """
@@ -47,6 +51,41 @@ def compute_metrics(y_true, y_pred, G):
         "AUC": auc
     }
 
+def plot_training_history(history, save_path="training_curves.png"):
+    """
+    根据记录的训练历史绘制并保存图像
+    """
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    plt.figure(figsize=(14, 5))
+    
+    # ---- 第一张子图：Loss 曲线 ----
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history['train_loss'], label='Train Loss', color='blue', linewidth=2)
+    plt.plot(epochs, history['val_loss'], label='Validation Loss', color='red', linestyle='--', linewidth=2)
+    plt.title('Training and Validation Loss', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # ---- 第二张子图：性能指标曲线 (AP & AUC) ----
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history['train_ap'], label='Train AP', color='green', linewidth=1.5)
+    plt.plot(epochs, history['val_ap'], label='Validation AP', color='orange', linewidth=2)
+    plt.plot(epochs, history['val_auc'], label='Validation AUC', color='purple', linestyle='-.', linewidth=2)
+    plt.title('Performance Metrics (AP & AUC)', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Score', fontsize=12)
+    plt.ylim(0, 1.05) # 指标通常在 0-1 之间
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight') # 保存为高清晰度图片
+    plt.close()
+    print(f"--> 训练性能曲线已保存至: {save_path}")
+
 def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, device="cuda"):
     """
     AIMNet 的完整训练函数
@@ -59,13 +98,20 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
     """
     model = model.to(device)
     
-    # 论文提到整个框架仅含一个损失函数，联合更新所有参数
+    # 论文提到整个框架仅含一个损失函数，联合更新所有参数 weight_decay=weight_decay权重衰减策略，就是在损失函数后添加L2 正则项
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     # 学习率衰减策略（非必需，但有助于深层网络稳定收敛）
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, verbose=True)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     
     best_ap = 0.0
+
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_ap': [], 'val_ap': [],
+        'train_auc': [], 'val_auc': []
+    }
+
     print("开始训练 AIMNet 模型...")
     print("-" * 50)
     
@@ -75,12 +121,10 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
             'x_list': [x.to(device) for x in data_dict['X']],
             'W': data_dict['W'].to(device),
             'Y': data_dict['Y'].to(device),
-            'G': data_dict['G'].to(device)
+            'G': data_dict['G'].to(device),
+            'edge_index': data_dict['C'].to(device)
         }
-        if 'C' in data_dict:
-            result['edge_index'] = data_dict['C'].to(device)
         return result
-
         
     train_inputs = to_device(train_data)
     val_inputs = to_device(val_data)
@@ -98,6 +142,7 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
         
         # 反向传播与参数更新
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) #梯度裁剪
         optimizer.step()
         
         # ================= 验证阶段 =================
@@ -111,8 +156,15 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
             val_metrics = compute_metrics(val_inputs['Y'], val_P, val_inputs['G'])
             
         # 调整学习率
-        scheduler.step(val_metrics["AP"])
+        # scheduler.step(val_metrics["AP"])
         
+        history['train_loss'].append(loss.item())
+        history['val_loss'].append(val_loss.item())
+        history['train_ap'].append(train_metrics['AP'])
+        history['val_ap'].append(val_metrics['AP'])
+        history['train_auc'].append(train_metrics['AUC'])
+        history['val_auc'].append(val_metrics['AUC'])
+
         # 打印日志
         if epoch % 10 == 0 or epoch == 1:
             print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f}")
@@ -126,6 +178,36 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
             torch.save(model.state_dict(), "best_aimnet_model.pt")
             print(f"--> 检测到更好的验证集 AP: {best_ap:.4f}, 模型权重已保存。")
             print("-" * 50)
+
+        if epoch % 20 == 0 or epoch == epochs:
+            plot_training_history(history, save_path="training_curves.png")
             
     print("训练完成！最佳验证集 AP:", best_ap)
     return model
+
+def features_num_extract(data):
+    view_dims = []
+    for i in range(len(data['X'])):
+        view_dims.append(data['X'][i].shape[1])
+    return view_dims
+
+def class_num_extract(data):
+    return data['Y'].shape[1]
+
+
+
+if __name__ == "__main__":
+
+    data = torch.load("data/processed/train_and_test_corel5k_03test_rate_05missing_rate.pt")
+    train_data = data['train']
+    val_data = data['test']
+
+    view_dims = features_num_extract(train_data)
+    n_classes = class_num_extract(train_data)
+
+    # 2. 实例化模型
+    model = models.AIMNet(view_dims=view_dims, n_classes=n_classes, d_e=128, tau=1.0)
+    
+    # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=0.00001, device=device)
