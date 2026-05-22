@@ -86,101 +86,121 @@ def plot_training_history(history, save_path="training_curves.png"):
     plt.close()
     print(f"--> 训练性能曲线已保存至: {save_path}")
 
-def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, device="cuda"):
-    """
-    AIMNet 的完整训练函数
-    train_data / val_data 应该是一个字典，包含:
-        - 'x_list': 列表 [X_1, X_2, ... X_m]
-        - 'edge_index': 标签图的边索引
-        - 'W': 视图缺失矩阵
-        - 'Y': 标签矩阵
-        - 'G': 标签缺失矩阵
-    """
+def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, batch_size=512, device="cuda"):
     model = model.to(device)
-    
-    # 论文提到整个框架仅含一个损失函数，联合更新所有参数 weight_decay=weight_decay权重衰减策略，就是在损失函数后添加L2 正则项
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     
-    # 学习率衰减策略（非必需，但有助于深层网络稳定收敛）
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
-    
     best_ap = 0.0
+    history = {'train_loss': [], 'val_loss': [], 'train_ap': [], 'val_ap': [], 'train_auc': [], 'val_auc': []}
 
-    history = {
-        'train_loss': [], 'val_loss': [],
-        'train_ap': [], 'val_ap': [],
-        'train_auc': [], 'val_auc': []
-    }
-
-    print("开始训练 AIMNet 模型...")
+    print(f"开始训练 AIMNet 模型 (Batch Size: {batch_size})...")
     print("-" * 50)
     
-    # 将训练数据和验证数据搬运到对应设备 (CPU/GPU)
+    # 辅助函数：将全量数据搬运到 GPU
     def to_device(data_dict):
-        result = {
+        return {
             'x_list': [x.to(device) for x in data_dict['X']],
             'W': data_dict['W'].to(device),
             'Y': data_dict['Y'].to(device),
             'G': data_dict['G'].to(device),
-            'edge_index': data_dict['C'].to(device)
+            'edge_index': data_dict['C'].to(device) # 注意：标签相关性图不用切分，它是全局的
         }
-        return result
         
     train_inputs = to_device(train_data)
     val_inputs = to_device(val_data)
+    n_train_samples = train_inputs['Y'].shape[0]
     
     for epoch in range(1, epochs + 1):
-        # ================= 训练阶段 =================
+        # ================= 训练阶段 (Mini-Batch) =================
         model.train()
-        optimizer.zero_grad()
+        epoch_train_loss = 0.0
         
-        # 前向传播
-        fused_logits = model(train_inputs['x_list'], train_inputs['edge_index'], train_inputs['W'])
+        # 1. 打乱训练集索引
+        indices = torch.randperm(n_train_samples, device=device)
         
-        # 计算带遮罩的损失 (公式 12)
-        loss = model.compute_loss(fused_logits, train_inputs['Y'], train_inputs['G'])
+        train_P_list = [] # 用于收集每个 batch 的预测概率，用于计算全局 AP
+        train_Y_list = []
+        train_G_list = []
         
-        # 反向传播与参数更新
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) #梯度裁剪
-        optimizer.step()
+        # 2. 遍历每个 Batch
+        for start_idx in range(0, n_train_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_train_samples)
+            batch_idx = indices[start_idx:end_idx]
+            
+            # 切割当前 batch 的数据
+            batch_x_list = [x[batch_idx] for x in train_inputs['x_list']]
+            batch_W = train_inputs['W'][batch_idx]
+            batch_Y = train_inputs['Y'][batch_idx]
+            batch_G = train_inputs['G'][batch_idx]
+            
+            optimizer.zero_grad()
+            
+            # 前向传播 (注意 edge_index 是标签图，不需要切分)
+            fused_logits = model(batch_x_list, train_inputs['edge_index'], batch_W)
+            loss = model.compute_loss(fused_logits, batch_Y, batch_G)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_train_loss += loss.item() * len(batch_idx) # 累加损失
+            
+            # 收集结果用于计算指标
+            train_P_list.append(torch.sigmoid(fused_logits).detach())
+            train_Y_list.append(batch_Y)
+            train_G_list.append(batch_G)
+            
+        # 计算该 epoch 的平均训练 loss
+        avg_train_loss = epoch_train_loss / n_train_samples
         
-        # ================= 验证阶段 =================
+        # 拼接所有的 batch 结果计算全局训练指标
+        all_train_P = torch.cat(train_P_list, dim=0)
+        all_train_Y = torch.cat(train_Y_list, dim=0)
+        all_train_G = torch.cat(train_G_list, dim=0)
+        train_metrics = compute_metrics(all_train_Y, all_train_P, all_train_G)
+        
+        # ================= 验证阶段 (为了防止验证集也爆显存，同样用 Batch，但不需要打乱) =================
         model.eval()
-        with torch.no_grad():
-            val_logits = model(val_inputs['x_list'], val_inputs['edge_index'], val_inputs['W'])
-            val_loss = model.compute_loss(val_logits, val_inputs['Y'], val_inputs['G'])
-            
-            # 计算当前 Epoch 的性能指标
-            fused_P = torch.sigmoid(fused_logits)
-            val_P = torch.sigmoid(val_logits)
-
-            train_metrics = compute_metrics(train_inputs['Y'], fused_P, train_inputs['G'])
-            val_metrics = compute_metrics(val_inputs['Y'], val_P, val_inputs['G'])
-            
-        # 调整学习率
-        # scheduler.step(val_metrics["AP"])
+        epoch_val_loss = 0.0
+        val_P_list = []
+        n_val_samples = val_inputs['Y'].shape[0]
         
-        history['train_loss'].append(loss.item())
-        history['val_loss'].append(val_loss.item())
+        with torch.no_grad():
+            for start_idx in range(0, n_val_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_val_samples)
+                
+                batch_x_list = [x[start_idx:end_idx] for x in val_inputs['x_list']]
+                batch_W = val_inputs['W'][start_idx:end_idx]
+                batch_Y = val_inputs['Y'][start_idx:end_idx]
+                batch_G = val_inputs['G'][start_idx:end_idx]
+                
+                val_logits = model(batch_x_list, val_inputs['edge_index'], batch_W)
+                val_loss = model.compute_loss(val_logits, batch_Y, batch_G)
+                
+                epoch_val_loss += val_loss.item() * (end_idx - start_idx)
+                val_P_list.append(torch.sigmoid(val_logits))
+                
+        avg_val_loss = epoch_val_loss / n_val_samples
+        all_val_P = torch.cat(val_P_list, dim=0)
+        val_metrics = compute_metrics(val_inputs['Y'], all_val_P, val_inputs['G'])
+            
+        # ================= 日志与保存 =================
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
         history['train_ap'].append(train_metrics['AP'])
         history['val_ap'].append(val_metrics['AP'])
         history['train_auc'].append(train_metrics['AUC'])
         history['val_auc'].append(val_metrics['AUC'])
 
-        # 打印日志
         if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f}")
+            print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
             print(f"  [Train] AP: {train_metrics['AP']:.4f}, 1-HL: {train_metrics['1-HL']:.4f}, AUC: {train_metrics['AUC']:.4f}")
             print(f"  [Val]   AP: {val_metrics['AP']:.4f}, 1-HL: {val_metrics['1-HL']:.4f}, AUC: {val_metrics['AUC']:.4f}")
             print("-" * 50)
             
-        # 保存最佳模型权重
         if val_metrics["AP"] > best_ap:
             best_ap = val_metrics["AP"]
             torch.save(model.state_dict(), "best_aimnet_model.pt")
-            print(f"--> 检测到更好的验证集 AP: {best_ap:.4f}, 模型权重已保存。")
-            print("-" * 50)
 
         if epoch % 20 == 0 or epoch == epochs:
             plot_training_history(history, save_path="training_curves.png")
@@ -201,7 +221,7 @@ def class_num_extract(data):
 
 if __name__ == "__main__":
 
-    data = torch.load("data/processed/train_and_test_corel5k_03test_rate_05missing_rate.pt")
+    data = torch.load("data/processed/train_and_test_espgame_03test_rate_05missing_rate.pt")
     train_data = data['train']
     val_data = data['test']
 
@@ -213,4 +233,4 @@ if __name__ == "__main__":
     
     # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trained_model = train_aimnet(model, train_data, val_data, epochs=200, lr=0.0001, device=device)
+    trained_model = train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, device=device)

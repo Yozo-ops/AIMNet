@@ -132,5 +132,5 @@ def data_processing(file_path, train_ratio=0.7, missing_rate=0.5):
     return data
 
 if __name__ == "__main__":
-    data = torch.load("data/processed/train_and_test_corel5k_03test_rate_05missing_rate.pt")
+    data = torch.load("data/processed/train_and_test_espgame_03test_rate_05missing_rate.pt")
     print(data['test'].keys())
