@@ -13,18 +13,37 @@ class AIMNet(nn.Module):
         self.feature_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_v, d_e),
-                nn.ReLU(),
-                nn.Linear(d_e, d_e)
+                nn.LeakyReLU(),
+                nn.Linear(d_e, d_e),
+                nn.Dropout(p = 0.2),
             ) for d_v in view_dims
         ])
+        self.parameters_reset(self.feature_extractors)
         
         # 2. 标签分支：初始嵌入和 K-head GAT
         self.label_embed = nn.Parameter(torch.Tensor(n_classes, n_classes))
         nn.init.xavier_uniform_(self.label_embed)
-        self.gat = GATConv(n_classes, d_e, heads=4, concat=False)
-        
+        self.gat = GATConv(n_classes, d_e, heads=8, concat=False)
+        self.gat.apply(self._init_gat_weights)
+
+
         # 3. 分类器：映射交互后的嵌入到 1 维 Logit (对应公式 8 后续)
         self.classifier = nn.Linear(d_e, 1)
+        nn.init.xavier_uniform_(self.classifier.weight)
+        
+
+    def parameters_reset(self,modulelist):
+        for module in modulelist:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+    
+    def _init_gat_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def attention_induced_imputation(self, z_list, W):
         A_list = []
@@ -39,6 +58,8 @@ class AIMNet(nn.Module):
 
         A_stack = torch.stack(A_list, dim=0)
         A_bar, _ = torch.max(A_stack, dim=0)
+
+        A_bar.fill_diagonal_(0.0)
 
         sum_A_bar = torch.sum(A_bar, dim=1, keepdim=True) + 1e-8
         A_bar_normalized = A_bar / sum_A_bar
@@ -92,17 +113,18 @@ class AIMNet(nn.Module):
             Q_list.append(q_v)
             
         Q = torch.stack(Q_list, dim=1) # [n_sample, m_views]
+        Q = torch.clamp(Q, min=0.0, max=1.0)
         Q_prime = (1.0 - W) * Q + W    # 真实存在的实例置信度固化为 1
         
         # ---- 第四阶段：多视图后期动态融合 (公式 11) ----
         Q_prime_expanded = Q_prime.unsqueeze(1) # [n_sample, 1, m_views]
         # 对各个视图的预测进行置信度加权平均
         fused_logits = torch.sum(P_stack * Q_prime_expanded, dim=2) / (torch.sum(Q_prime, dim=1, keepdim=True) + 1e-8)
-        fused_P = torch.sigmoid(fused_logits) # [n_sample, n_classes]
+        # fused_P = torch.sigmoid(fused_logits) # [n_sample, n_classes]
         
-        return fused_P
+        return fused_logits
 
-    def compute_loss(self, fused_P, Y, G):
+    def compute_loss(self, fused_logits, Y, G):
         """
         对应公式 (12): Masked Binary Cross Entropy Loss
         Args:
@@ -112,7 +134,7 @@ class AIMNet(nn.Module):
         """
         eps = 1e-8
         # 计算每个位置完整的交叉熵
-        loss_matrix = -(Y * torch.log(fused_P + eps) + (1.0 - Y) * torch.log(1.0 - fused_P + eps))
+        loss_matrix = F.binary_cross_entropy_with_logits(fused_logits, Y, reduction='none')
         
         # 使用掩码矩阵 G 过滤掉未知标签的损失
         masked_loss = loss_matrix * G

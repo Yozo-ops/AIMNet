@@ -135,10 +135,10 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
         optimizer.zero_grad()
         
         # 前向传播
-        fused_P = model(train_inputs['x_list'], train_inputs['edge_index'], train_inputs['W'])
+        fused_logits = model(train_inputs['x_list'], train_inputs['edge_index'], train_inputs['W'])
         
         # 计算带遮罩的损失 (公式 12)
-        loss = model.compute_loss(fused_P, train_inputs['Y'], train_inputs['G'])
+        loss = model.compute_loss(fused_logits, train_inputs['Y'], train_inputs['G'])
         
         # 反向传播与参数更新
         loss.backward()
@@ -148,10 +148,13 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
         # ================= 验证阶段 =================
         model.eval()
         with torch.no_grad():
-            val_P = model(val_inputs['x_list'], val_inputs['edge_index'], val_inputs['W'])
-            val_loss = model.compute_loss(val_P, val_inputs['Y'], val_inputs['G'])
+            val_logits = model(val_inputs['x_list'], val_inputs['edge_index'], val_inputs['W'])
+            val_loss = model.compute_loss(val_logits, val_inputs['Y'], val_inputs['G'])
             
             # 计算当前 Epoch 的性能指标
+            fused_P = torch.sigmoid(fused_logits)
+            val_P = torch.sigmoid(val_logits)
+
             train_metrics = compute_metrics(train_inputs['Y'], fused_P, train_inputs['G'])
             val_metrics = compute_metrics(val_inputs['Y'], val_P, val_inputs['G'])
             
@@ -210,4 +213,4 @@ if __name__ == "__main__":
     
     # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=0.00001, device=device)
+    trained_model = train_aimnet(model, train_data, val_data, epochs=200, lr=0.0001, device=device)
