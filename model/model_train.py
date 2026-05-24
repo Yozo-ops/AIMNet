@@ -80,7 +80,7 @@ def plot_training_history(history, save_path="training_curves.png"):
 
 def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, batch_size=512, device="cuda"):
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
     
     best_ap = 0.0
     history = {'train_loss': [], 'val_loss': [], 'train_ap': [], 'val_ap': [], 'train_auc': [], 'val_auc': []}
@@ -221,8 +221,8 @@ if __name__ == "__main__":
     n_classes = class_num_extract(train_data)
 
     # 2. 实例化模型
-    model = models.AIMNet(view_dims=view_dims, n_classes=n_classes, d_e=128, tau=0.2)
+    model = models.AIMNet(view_dims=view_dims, n_classes=n_classes, d_e=512, tau=0.2)
     
     # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=0.001, device=device) 
+    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=1, device=device) 
