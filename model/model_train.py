@@ -8,42 +8,34 @@ import os
 
 
 def compute_metrics(y_true, y_pred, G):
-    """
-    根据论文要求计算评估指标 (只在已知/有效的测试标签上评估，或在全量完整测试集上评估)
-    y_true: [n_samples, n_classes]
-    y_pred: [n_samples, n_classes] (模型的概率输出)
-    G: [n_samples, n_classes] (已知标签掩码，如果是全量完整测试集则全为1)
-    """
-    # 转为 numpy 方便计算
     y_true_np = y_true.cpu().detach().numpy()
     y_pred_np = y_pred.cpu().detach().numpy()
     G_np = G.cpu().detach().numpy()
     
-    # 论文指标 1: 1 - Hamming Loss
-    # 注意：标准多标签需将预测概率二值化 (以0.5为界)
+    # 1. Hamming Loss
     y_pred_bin = (y_pred_np >= 0.5).astype(int)
-    # 只计算已知标签处的 Hamming Loss
     actual_elements = np.sum(G_np)
-    if actual_elements == 0:
-        hl = 0.0
-    else:
-        hl = np.sum((y_true_np != y_pred_bin) * G_np) / actual_elements
+    hl = np.sum((y_true_np != y_pred_bin) * G_np) / actual_elements if actual_elements > 0 else 0.0
     one_minus_hl = 1.0 - hl
     
-    # 论文指标 2: Average Precision (AP)
-    # 分别计算每个样本或每个类别的 AP，这里采用宏观/微观或过滤未知后的标准 sklearn AP
-    # 为了简化且不失准确性，我们在计算有效位置的总体 AP
-    try:
-        # 过滤掉完全没有正样本或全为负样本的无效位置（sklearn 限制）
-        ap = average_precision_score(y_true_np[G_np == 1], y_pred_np[G_np == 1])
-    except ValueError:
-        ap = 0.0
+    # 2. 计算 Macro AP 和 Macro AUC
+    ap_list = []
+    auc_list = []
+    n_classes = y_true_np.shape[1]
+    
+    for i in range(n_classes):
+        # 仅提取当前类别下，G=1 (已知) 的样本
+        valid_idx = (G_np[:, i] == 1)
+        y_t = y_true_np[valid_idx, i]
+        y_p = y_pred_np[valid_idx, i]
         
-    # 论文指标 3: AUC
-    try:
-        auc = roc_auc_score(y_true_np[G_np == 1], y_pred_np[G_np == 1])
-    except ValueError:
-        auc = 0.5
+        # sklearn 限制：只有该类别同时存在正样本和负样本时，计算指标才有意义
+        if len(np.unique(y_t)) == 2:
+            ap_list.append(average_precision_score(y_t, y_p))
+            auc_list.append(roc_auc_score(y_t, y_p))
+            
+    ap = np.mean(ap_list) if len(ap_list) > 0 else 0.0
+    auc = np.mean(auc_list) if len(auc_list) > 0 else 0.5
 
     return {
         "1-HL": one_minus_hl,
@@ -229,8 +221,8 @@ if __name__ == "__main__":
     n_classes = class_num_extract(train_data)
 
     # 2. 实例化模型
-    model = models.AIMNet(view_dims=view_dims, n_classes=n_classes, d_e=128, tau=1.0)
+    model = models.AIMNet(view_dims=view_dims, n_classes=n_classes, d_e=128, tau=0.2)
     
     # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trained_model = train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, device=device)
+    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=0.001, device=device) 

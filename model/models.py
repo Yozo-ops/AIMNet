@@ -4,32 +4,37 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
 class AIMNet(nn.Module):
-    def __init__(self, view_dims, n_classes, d_e=512, tau=1.0):
+    def __init__(self, view_dims, n_classes, heads=4, d_e=512, tau=1.0):
         super(AIMNet, self).__init__()
         self.tau = tau
         self.m_views = len(view_dims)
-        
+        self.heads = heads
+
         # 1. 特征分支：各视图独立的 MLP
         self.feature_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_v, d_e),
                 nn.LeakyReLU(),
                 nn.Linear(d_e, d_e),
-                nn.Dropout(p = 0.2),
+                nn.LayerNorm(d_e),
+                nn.Dropout(),
             ) for d_v in view_dims
         ])
         self.parameters_reset(self.feature_extractors)
         
         # 2. 标签分支：初始嵌入和 K-head GAT
-        self.label_embed = nn.Parameter(torch.Tensor(n_classes, n_classes))
-        nn.init.xavier_uniform_(self.label_embed)
-        self.gat = GATConv(n_classes, d_e, heads=8, concat=False)
-        self.gat.apply(self._init_gat_weights)
+        self.label_embed = nn.Parameter(torch.eye(n_classes, n_classes))
+        self.gat1 = GATConv(n_classes, d_e, heads=heads, concat=True)
+        self.gat1.apply(self._init_gat_weights)
+        self.gat2 = GATConv(d_e*heads, d_e, heads=heads, concat=False)
+        self.gat2.apply(self._init_gat_weights)
+
 
 
         # 3. 分类器：映射交互后的嵌入到 1 维 Logit (对应公式 8 后续)
         self.classifier = nn.Linear(d_e, 1)
         nn.init.xavier_uniform_(self.classifier.weight)
+        # nn.init.constant_(self.classifier.bias, -4.0)
         
 
     def parameters_reset(self,modulelist):
@@ -84,7 +89,9 @@ class AIMNet(nn.Module):
             fused_P: 最终的多视图融合预测概率 [n_sample, n_classes]
         """
         # ---- 第一、二阶段：提取标签与实例基础表征 ----
-        label_features = F.leaky_relu(self.gat(self.label_embed, edge_index)) # [n_classes, d_e]
+        out = self.gat1(self.label_embed, edge_index)
+        out = self.gat2(out, edge_index)
+        label_features = F.leaky_relu(out) # [n_classes, d_e]
         z_list = [self.feature_extractors[v](x_list[v]) for v in range(self.m_views)]
         
         # ---- 第三阶段：注意力诱导特征填补 ----
@@ -133,8 +140,16 @@ class AIMNet(nn.Module):
             G: 标签缺失指示矩阵 [n_sample, n_classes] (1代表已知，0代表缺失)
         """
         eps = 1e-8
+
+        # 【新增】：动态计算每个类别的正负样本比例作为权重
+        num_pos = torch.sum(Y * G, dim=0)
+        num_neg = torch.sum((1.0 - Y) * G, dim=0)
+        
+        # 计算正样本权重，并限制最大倍数（防止极稀有类别导致梯度爆炸，上限设为 50 倍）
+        pos_weight = torch.clamp(num_neg / (num_pos + eps), min=1.0, max=50.0)
+
         # 计算每个位置完整的交叉熵
-        loss_matrix = F.binary_cross_entropy_with_logits(fused_logits, Y, reduction='none')
+        loss_matrix = F.binary_cross_entropy_with_logits(fused_logits, Y, pos_weight=pos_weight, reduction='none')
         
         # 使用掩码矩阵 G 过滤掉未知标签的损失
         masked_loss = loss_matrix * G
