@@ -23,7 +23,10 @@ class AIMNet(nn.Module):
         
         
         # 2. 标签分支：初始嵌入和 K-head GAT
-        self.label_embed = nn.Parameter(torch.eye(n_classes, n_classes))
+        # 采用独热编码而不进行初始化，区分每一个标签；由于各个标签嵌入正交，GAT没有办法计算注意力？
+        self.label_embed = nn.Parameter(torch.eye(n_classes, n_classes) + torch.normal(0, 1, size=(n_classes, n_classes)))
+        # 正态分布初始化？
+        # nn.init.normal_(self.label_embed, std=0.01)
 
         self.gat1 = GATConv(n_classes, d_e, heads=heads, concat=True)
         self.gat2 = GATConv(d_e*heads, d_e, heads=heads, concat=False)

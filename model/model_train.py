@@ -5,36 +5,60 @@ from sklearn.metrics import average_precision_score, hamming_loss, roc_auc_score
 import matplotlib.pyplot as plt
 import models
 import os 
+import random
 
+
+def set_all_seeds(seed=42):
+    """
+    固定所有的随机种子，确保实验的完全可复现性
+    """
+    # 1. 固定 Python 内置随机种子
+    random.seed(seed)
+    
+    # 2. 固定 Numpy 随机种子
+    np.random.seed(seed)
+    
+    # 3. 固定 PyTorch 随机种子 (CPU)
+    torch.manual_seed(seed)
+    
+    # 4. 固定 PyTorch 随机种子 (GPU)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        # torch.cuda.manual_seed_all(seed)
+    # 5. 强制底层 cuDNN 使用确定性算法 (极其关键)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def compute_metrics(y_true, y_pred, G):
     y_true_np = y_true.cpu().detach().numpy()
     y_pred_np = y_pred.cpu().detach().numpy()
     G_np = G.cpu().detach().numpy()
     
-    # 1. Hamming Loss
+    # 1. 1-Hamming Loss
     y_pred_bin = (y_pred_np >= 0.5).astype(int)
     actual_elements = np.sum(G_np)
     hl = np.sum((y_true_np != y_pred_bin) * G_np) / actual_elements if actual_elements > 0 else 0.0
     one_minus_hl = 1.0 - hl
     
-    # 2. 计算 Macro AP 和 Macro AUC
+    # 2. 【核心修复】：计算 Sample-wise AP (对齐官方 evaluation.py)
     ap_list = []
+    num_samples = y_true_np.shape[0]
+    for i in range(num_samples):
+        y_t = y_true_np[i]
+        y_p = y_pred_np[i]
+        if np.sum(y_t) > 0:  # 只有存在正标签的样本才能计算 AP
+            ap_list.append(average_precision_score(y_t, y_p))
+    ap = np.mean(ap_list) if len(ap_list) > 0 else 0.0
+    
+    # 3. 计算 Macro AUC (对齐官方 evaluation.py)
     auc_list = []
     n_classes = y_true_np.shape[1]
-    
     for i in range(n_classes):
-        # 仅提取当前类别下，G=1 (已知) 的样本
         valid_idx = (G_np[:, i] == 1)
         y_t = y_true_np[valid_idx, i]
         y_p = y_pred_np[valid_idx, i]
-        
-        # sklearn 限制：只有该类别同时存在正样本和负样本时，计算指标才有意义
         if len(np.unique(y_t)) == 2:
-            ap_list.append(average_precision_score(y_t, y_p))
             auc_list.append(roc_auc_score(y_t, y_p))
-            
-    ap = np.mean(ap_list) if len(ap_list) > 0 else 0.0
     auc = np.mean(auc_list) if len(auc_list) > 0 else 0.5
 
     return {
@@ -212,6 +236,7 @@ def class_num_extract(data):
 
 
 if __name__ == "__main__":
+    set_all_seeds(42)
 
     data = torch.load("data/processed/train_and_test_espgame_03test_rate_05missing_rate.pt")
     train_data = data['train']
@@ -225,4 +250,4 @@ if __name__ == "__main__":
     
     # 3. 运行训练 (如果没有 GPU，可以将 device 改为 "cpu")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=1, device=device) 
+    trained_model = train_aimnet(model, train_data, val_data, epochs=100, lr=0.1, device=device) 
