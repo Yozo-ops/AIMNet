@@ -104,7 +104,7 @@ def plot_training_history(history, save_path="training_curves.png"):
 
 def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, batch_size=512, device="cuda"):
     model = model.to(device)
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
     
     best_ap = 0.0
     history = {'train_loss': [], 'val_loss': [], 'train_ap': [], 'val_ap': [], 'train_auc': [], 'val_auc': []}
