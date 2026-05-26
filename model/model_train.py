@@ -5,6 +5,7 @@ from sklearn.metrics import average_precision_score, hamming_loss, roc_auc_score
 import matplotlib.pyplot as plt
 import models
 import os 
+import pandas as pd
 import random
 
 
@@ -34,25 +35,59 @@ def compute_metrics(y_true, y_pred, G):
     y_pred_np = y_pred.cpu().detach().numpy()
     G_np = G.cpu().detach().numpy()
     
+    num_samples, n_classes = y_true_np.shape
+    
     # 1. 1-Hamming Loss
     y_pred_bin = (y_pred_np >= 0.5).astype(int)
     actual_elements = np.sum(G_np)
     hl = np.sum((y_true_np != y_pred_bin) * G_np) / actual_elements if actual_elements > 0 else 0.0
     one_minus_hl = 1.0 - hl
     
-    # 2. 【核心修复】：计算 Sample-wise AP (对齐官方 evaluation.py)
-    ap_list = []
-    num_samples = y_true_np.shape[0]
-    for i in range(num_samples):
-        y_t = y_true_np[i]
-        y_p = y_pred_np[i]
-        if np.sum(y_t) > 0:  # 只有存在正标签的样本才能计算 AP
-            ap_list.append(average_precision_score(y_t, y_p))
-    ap = np.mean(ap_list) if len(ap_list) > 0 else 0.0
+    # 为了防止模型将未知的标签（G=0）排在前面，我们将未知预测的分数设为极小值
+    masked_y_pred = np.where(G_np == 1, y_pred_np, -np.inf)
     
-    # 3. 计算 Macro AUC (对齐官方 evaluation.py)
+    # 2. 1-One Error (1-OE)
+    # One Error 评估的是：模型给出的最高分预测标签，是否是一个错误的标签。
+    top_idx = np.argmax(masked_y_pred, axis=1)
+    oe = np.mean(y_true_np[np.arange(num_samples), top_idx] == 0)
+    one_minus_oe = 1.0 - oe
+    
+    # 3. 1-Coverage (1-COV)
+    # 排序：分数越高的标签 rank 值越小 (排第1名则 rank=1)
+    sorted_indices = np.argsort(-masked_y_pred, axis=1)
+    ranks = np.empty_like(sorted_indices)
+    np.put_along_axis(ranks, sorted_indices, np.arange(1, n_classes + 1), axis=1)
+    
+    true_pos_mask = (y_true_np == 1) & (G_np == 1)
+    valid_samples = np.sum(true_pos_mask, axis=1) > 0 # 只计算至少有一个正标签的样本
+    
+    # 找出每个样本中，排得最后的那一个真实正标签的 rank
+    cov_per_sample = np.max(np.where(true_pos_mask, ranks, 0), axis=1) - 1
+    cov = np.mean(cov_per_sample[valid_samples]) / n_classes if np.sum(valid_samples) > 0 else 0.0
+    one_minus_cov = 1.0 - cov
+    
+    # 4. Sample-wise AP & Ranking Loss (RL)
+    # 数学上，对于单个样本，(1 - AUC) 完全等价于 Ranking Loss (错误排序对的比例)
+    ap_list = []
+    rl_list = []
+    
+    for i in range(num_samples):
+        valid = G_np[i] == 1
+        y_t = y_true_np[i, valid]
+        y_p = y_pred_np[i, valid]
+        
+        if np.sum(y_t) > 0:  
+            ap_list.append(average_precision_score(y_t, y_p))
+            
+        if 0 < np.sum(y_t) < len(y_t): # 只有同时存在正类和负类才能算排序
+            rl_list.append(1.0 - roc_auc_score(y_t, y_p))
+            
+    ap = np.mean(ap_list) if len(ap_list) > 0 else 0.0
+    rl = np.mean(rl_list) if len(rl_list) > 0 else 0.0
+    one_minus_rl = 1.0 - rl
+    
+    # 5. Macro AUC
     auc_list = []
-    n_classes = y_true_np.shape[1]
     for i in range(n_classes):
         valid_idx = (G_np[:, i] == 1)
         y_t = y_true_np[valid_idx, i]
@@ -64,7 +99,10 @@ def compute_metrics(y_true, y_pred, G):
     return {
         "1-HL": one_minus_hl,
         "AP": ap,
-        "AUC": auc
+        "AUC": auc,
+        "1-OE": one_minus_oe,
+        "1-COV": one_minus_cov,
+        "1-RL": one_minus_rl
     }
 
 def plot_training_history(history, save_path="training_curves.png"):
@@ -73,10 +111,10 @@ def plot_training_history(history, save_path="training_curves.png"):
     """
     epochs = range(1, len(history['train_loss']) + 1)
     
-    plt.figure(figsize=(14, 5))
+    plt.figure(figsize=(18, 5))
     
     # ---- 第一张子图：Loss 曲线 ----
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(epochs, history['train_loss'], label='Train Loss', color='blue', linewidth=2)
     plt.plot(epochs, history['val_loss'], label='Validation Loss', color='red', linestyle='--', linewidth=2)
     plt.title('Training and Validation Loss', fontsize=14)
@@ -85,29 +123,48 @@ def plot_training_history(history, save_path="training_curves.png"):
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # ---- 第二张子图：性能指标曲线 (AP & AUC) ----
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, history['train_ap'], label='Train AP', color='green', linewidth=1.5)
-    plt.plot(epochs, history['val_ap'], label='Validation AP', color='orange', linewidth=2)
-    plt.plot(epochs, history['val_auc'], label='Validation AUC', color='purple', linestyle='-.', linewidth=2)
-    plt.title('Performance Metrics (AP & AUC)', fontsize=14)
+    # ---- 第二张子图：核心排序指标 (AP & AUC) ----
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, history['val_ap'], label='Val AP', color='orange', linewidth=2)
+    plt.plot(epochs, history['val_auc'], label='Val AUC', color='purple', linestyle='-.', linewidth=2)
+    plt.title('Core Metrics (Val AP & AUC)', fontsize=14)
     plt.xlabel('Epochs', fontsize=12)
     plt.ylabel('Score', fontsize=12)
-    plt.ylim(0, 1.05) # 指标通常在 0-1 之间
+    plt.ylim(0, 1.05) 
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # ---- 第三张子图：多标签辅助指标 ----
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, history['val_1_hl'], label='Val 1-HL', color='green')
+    plt.plot(epochs, history['val_1_rl'], label='Val 1-RL', color='brown')
+    plt.plot(epochs, history['val_1_oe'], label='Val 1-OE', color='pink')
+    plt.plot(epochs, history['val_1_cov'], label='Val 1-COV', color='gray')
+    plt.title('Other Multilabel Metrics (Val)', fontsize=14)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Score', fontsize=12)
+    plt.ylim(0, 1.05) 
     plt.legend()
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight') # 保存为高清晰度图片
+    plt.savefig(save_path, dpi=300, bbox_inches='tight') 
     plt.close()
-    print(f"--> 训练性能曲线已保存至: {save_path}")
 
 def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay=1e-5, batch_size=512, device="cuda"):
     model = model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
     
     best_ap = 0.0
-    history = {'train_loss': [], 'val_loss': [], 'train_ap': [], 'val_ap': [], 'train_auc': [], 'val_auc': []}
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_ap': [], 'val_ap': [],
+        'train_auc': [], 'val_auc': [],
+        'train_1_hl': [], 'val_1_hl': [],
+        'train_1_rl': [], 'val_1_rl': [],
+        'train_1_oe': [], 'val_1_oe': [],
+        'train_1_cov': [], 'val_1_cov': []
+    }
 
     print(f"开始训练 AIMNet 模型 (Batch Size: {batch_size})...")
     print("-" * 50)
@@ -207,12 +264,22 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
         history['val_ap'].append(val_metrics['AP'])
         history['train_auc'].append(train_metrics['AUC'])
         history['val_auc'].append(val_metrics['AUC'])
+        history['train_1_hl'].append(train_metrics['1-HL'])
+        history['val_1_hl'].append(val_metrics['1-HL'])
+        history['train_1_rl'].append(train_metrics['1-RL'])
+        history['val_1_rl'].append(val_metrics['1-RL'])
+        history['train_1_oe'].append(train_metrics['1-OE'])
+        history['val_1_oe'].append(val_metrics['1-OE'])
+        history['train_1_cov'].append(train_metrics['1-COV'])
+        history['val_1_cov'].append(val_metrics['1-COV'])
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-            print(f"  [Train] AP: {train_metrics['AP']:.4f}, 1-HL: {train_metrics['1-HL']:.4f}, AUC: {train_metrics['AUC']:.4f}")
-            print(f"  [Val]   AP: {val_metrics['AP']:.4f}, 1-HL: {val_metrics['1-HL']:.4f}, AUC: {val_metrics['AUC']:.4f}")
-            print("-" * 50)
+            print(f"  [Train] AP: {train_metrics['AP']:.4f} | AUC: {train_metrics['AUC']:.4f} | 1-HL: {train_metrics['1-HL']:.4f}")
+            print(f"          1-RL: {train_metrics['1-RL']:.4f} | 1-OE: {train_metrics['1-OE']:.4f} | 1-COV: {train_metrics['1-COV']:.4f}")
+            print(f"  [Val]   AP: {val_metrics['AP']:.4f} | AUC: {val_metrics['AUC']:.4f} | 1-HL: {val_metrics['1-HL']:.4f}")
+            print(f"          1-RL: {val_metrics['1-RL']:.4f} | 1-OE: {val_metrics['1-OE']:.4f} | 1-COV: {val_metrics['1-COV']:.4f}")
+            print("-" * 60)
             
         if val_metrics["AP"] > best_ap:
             best_ap = val_metrics["AP"]
@@ -220,6 +287,9 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
 
         if epoch % 20 == 0 or epoch == epochs:
             plot_training_history(history, save_path="training_curves.png")
+            # 【修改】：将指标历史导出为标准的电子表格文件
+            # pd.DataFrame(history).to_excel("training_history.xlsx", index=False)
+            print(f"--> 训练性能图表与详细历史数据 (.xlsx) 已保存")
             
     print("训练完成！最佳验证集 AP:", best_ap)
     return model

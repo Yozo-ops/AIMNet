@@ -14,10 +14,10 @@ class AIMNet(nn.Module):
         self.feature_extractors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_v, d_e),
-                nn.LeakyReLU(0.1)
+                nn.LeakyReLU(0.1),
                 # nn.Linear(d_e, d_e),
                 # nn.LayerNorm(d_e),
-                # nn.Dropout(),
+                nn.Dropout()
             ) for d_v in view_dims
         ])
         
@@ -27,9 +27,10 @@ class AIMNet(nn.Module):
         self.label_embed = nn.Parameter(torch.eye(n_classes, n_classes) + torch.normal(0, 0.1, size=(n_classes, n_classes)))
         # 正态分布初始化？
         nn.init.normal_(self.label_embed)
-
-        self.gat1 = GATConv(n_classes, d_e, heads=heads, dropout=0.2, concat=True)
-        self.gat2 = GATConv(d_e*heads, d_e, heads=heads, dropout=0.2, concat=False)
+        self.dropout1 = nn.Dropout()
+        self.dropout2 = nn.Dropout()
+        self.gat1 = GATConv(n_classes, d_e, heads=heads, dropout=0.5, concat=True)
+        self.gat2 = GATConv(d_e*heads, d_e, dropout=0.5, concat=False)
         
 
 
@@ -87,7 +88,9 @@ class AIMNet(nn.Module):
         return z_hat_list, A_bar
 
     def forward(self, x_list, edge_index, W):
-        out = self.gat1(self.label_embed, edge_index)
+        out = self.dropout1(self.label_embed)
+        out = self.gat1(out, edge_index)
+        out = self.dropout2(out)
         out = self.gat2(out, edge_index)
         label_features = F.leaky_relu(out) # [n_classes, d_e]
         
