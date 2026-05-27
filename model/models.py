@@ -92,7 +92,7 @@ class AIMNet(nn.Module):
         out = self.gat1(out, edge_index)
         out = self.dropout2(out)
         out = self.gat2(out, edge_index)
-        label_features = F.leaky_relu(out) # [n_classes, d_e]
+        label_features = F.elu(out) # [n_classes, d_e]
         
         z_list = [self.feature_extractors[v](x_list[v]) for v in range(self.m_views)]
         z_hat_list, A_bar = self.attention_induced_imputation(z_list, W)

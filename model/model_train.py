@@ -286,7 +286,7 @@ def train_aimnet(model, train_data, val_data, epochs=200, lr=0.001, weight_decay
             torch.save(model.state_dict(), "best_aimnet_model.pt")
 
         if epoch % 20 == 0 or epoch == epochs:
-            plot_training_history(history, save_path="training_curves.png")
+            plot_training_history(history, save_path="training_curves_5.27.png")
             # 【修改】：将指标历史导出为标准的电子表格文件
             # pd.DataFrame(history).to_excel("training_history.xlsx", index=False)
             print(f"--> 训练性能图表与详细历史数据 (.xlsx) 已保存")
